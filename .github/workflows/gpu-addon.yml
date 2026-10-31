@@ -1,0 +1,93 @@
+name: Pro GPU addon (pinned)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  addon:
+    runs-on: macos-26-intel
+    timeout-minutes: 180
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - name: Check out the device
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: rootstockos/UniXNU-asteroids
+          ref: c774b7030145b431a8bfbe0d68e16ffa08cebc75
+          path: device
+          submodules: true
+          persist-credentials: false
+      - name: Check out UniXNU
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: rootstockos/UniXNU
+          ref: 3463ca5d368b012236a249321a6649cd58f25aeb
+          path: unixnu
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+      - name: Verify sources and install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C device rev-parse HEAD)" = c774b7030145b431a8bfbe0d68e16ffa08cebc75
+          test "$(git -C device/drivers/Adreno740 rev-parse HEAD)" = 5e2b23e058fe97d3380c2753a7e11a220e8f33ff
+          test "$(git -C unixnu rev-parse HEAD)" = 3463ca5d368b012236a249321a6649cd58f25aeb
+          git -C unixnu submodule update --init --depth 1 drivers/AdrenoMetal drivers/GopFramebuffer kits/AdrenoPM4
+          ln -s GopFramebuffer unixnu/drivers/NativeMobileDisplay
+          test -d "$DEVELOPER_DIR"
+          brew install llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+      - name: Build original trust from public IPSW
+        working-directory: unixnu
+        shell: bash
+        run: |
+          set -euo pipefail
+          url=$(python3 -c "import tomllib; print(tomllib.load(open('profiles/os/ipados-17.7.11-21H461/profile.toml','rb'))['ipsw']['url'])")
+          python3 scripts/build-original-system-trust.py --ipsw "$url"
+          echo '7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7  build/original-static-system-trust/original-static-system.bundle' | shasum -a 256 -c
+      - name: Build Turnip
+        run: python3 device/scripts/prepare-asteroids-turnip.py --unixnu unixnu
+      - name: Build Metal bridge
+        working-directory: unixnu
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -r repo commit < <(python3 -c "import json; t=json.load(open('scripts/data/gpu-metal-vulkan-inputs.json'))['translator']; print(t['repository'],t['commit'])")
+          src=.cache/gpu-reference/metal2vulkan
+          git init -q "$src"
+          git -C "$src" fetch -q --depth 1 --filter=blob:none "$repo" "$commit"
+          git -C "$src" -c advice.detachedHead=false checkout -q FETCH_HEAD
+          python3 scripts/build-adreno-metal-bridge.py --target ios
+      - name: Build addon
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 device/scripts/build-asteroids-metal-plugin.py --unixnu unixnu --published --clients '' --no-audio --trust-cache unixnu/build/original-static-system-trust/original-static-system.bundle
+      - name: Encrypt addon
+        shell: bash
+        env:
+          ARTIFACT_PASSPHRASE: ${{ secrets.ARTIFACT_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          [[ "$ARTIFACT_PASSPHRASE" =~ ^[0-9a-f]{64}$ ]] || { echo 'Artifact secret must be 64 lowercase hex digits'; exit 1; }
+          out=device/build/asteroids-metal-plugin-published
+          mkdir -p "$RUNNER_TEMP/encrypted"
+          tar -C "$out" -czf "$RUNNER_TEMP/plain.tar.gz" asteroids-metal.addon owner-trust.bundle trust.json
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:ARTIFACT_PASSPHRASE -in "$RUNNER_TEMP/plain.tar.gz" -out "$RUNNER_TEMP/encrypted/gpu-addon.tar.gz.enc"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:ARTIFACT_PASSPHRASE -in "$RUNNER_TEMP/encrypted/gpu-addon.tar.gz.enc" -out "$RUNNER_TEMP/verify.tar.gz"
+          cmp "$RUNNER_TEMP/plain.tar.gz" "$RUNNER_TEMP/verify.tar.gz"
+          python3 -c 'import hashlib,hmac,os,pathlib; p=pathlib.Path(os.environ["RUNNER_TEMP"])/"encrypted/gpu-addon.tar.gz.enc"; k=hashlib.sha256(b"unixnu-addon-hmac-v1\0"+os.environ["ARTIFACT_PASSPHRASE"].encode()).digest(); (p.parent/"gpu-addon.tar.gz.enc.hmac").write_text(hmac.new(k,p.read_bytes(),hashlib.sha256).hexdigest()+"\n")'
+          rm "$RUNNER_TEMP/plain.tar.gz" "$RUNNER_TEMP/verify.tar.gz"
+      - name: Upload encrypted result
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pro-gpu-addon-encrypted
+          path: ${{ runner.temp }}/encrypted/
+          if-no-files-found: error
+          retention-days: 1
